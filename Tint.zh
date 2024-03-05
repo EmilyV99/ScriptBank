@@ -1,0 +1,695 @@
+///////////////////////////////////
+//         Tint.zh Header        //
+//             Emily             //
+//         Version: 1.03         //
+//           31 May 21           //
+///////////////////////////////////
+
+#option HEADER_GUARD on
+import "std.zh"
+
+namespace TintZH
+{
+	//start typedefs
+	typedef const int DEFINE;
+	typedef const long DEFINEL;
+	typedef const int CONFIG;
+	typedef const bool CONFIGB;
+	//end
+	//start Constants
+	//Definitions:
+	DEFINE DATA_SIZE = 2000;
+	DEFINEL STATE_HIDDEN = 00000001bL;
+	DEFINEL STATE_PAUSED = 00000010bL;
+	//
+	DEFINE TINT_GREYSCALE = 0; //The tint at ID 0 will always be "0,0,0". In BASE_TINTED, this will do nothing; in either other base, it will perform greyscale.
+	//Configs:
+	CONFIG MAX_TINT_PALETTES = 512; //The maximum number of saved tint palettes
+	CONFIG BASE_DEFAULT = BASE_TINTED; //This will be the default base used.
+	CONFIG GRADIENT_RATE = 1; //Every how many frames should the gradient update? Max 3600, Min 1.
+	CONFIGB DEBUG = false; //Set to true to enable debug traces
+	//start Asserts
+	CONST_ASSERT(GRADIENT_RATE >= 1 && GRADIENT_RATE <= 3600 && !(GRADIENT_RATE%1), "[Tint.zh] GRADIENT_RATE must be an integer between 1 and 3600, inclusive!");
+	//end Asserts
+	//end
+	enum Base
+	{
+		BASE_MIN,
+		BASE_TINTED = BASE_MIN,
+		BASE_UNIFORM,
+		BASE_DISTRIBUTED,
+		BASE_MAX = BASE_DISTRIBUTED
+	};
+	//start Internal Array Indexes
+	enum TintDataIndex
+	{
+		//Misc
+		DATA_UPDATED, 			//Has the runTints() updated the screen since the last modification?
+		DATA_NEXT_PALETTE, 		//What is the next open palette index to store to?
+		DATA_TINT_PAUSED,
+		//Tint Data
+		DATA_BASE, 				//What base is currently being used?
+		DATA_R_SUM, 			//What is the total red tint currently active?
+		DATA_G_SUM, 			//What is the total green tint currently active?
+		DATA_B_SUM, 			//What is the total blue tint currently active?
+		DATA_R_CHANGED, 		//What has red been modified by since the last time runTints() updated the screen?
+		DATA_G_CHANGED, 		//What has green been modified by since the last time runTints() updated the screen?
+		DATA_B_CHANGED, 		//What has blue been modified by since the last time runTints() updated the screen?
+		//Gradients: The counter and rate will be cleared when the gradient is disabled. The other values will retain, until a new gradient is run.
+		DATA_GRADIENT_RATE, 	//How many frames should the gradient take to get from beginning to end?
+		DATA_GRADIENT_COUNTER, 	//How many frames has it been since the gradient was activated?
+		DATA_R_GRADIENT_S, 		//What is the starting red of the current gradient?
+		DATA_G_GRADIENT_S, 		//What is the starting green of the current gradient?
+		DATA_B_GRADIENT_S, 		//What is the starting blue of the current gradient?
+		DATA_R_GRADIENT_F, 		//What is the finishing red of the current gradient?
+		DATA_G_GRADIENT_F, 		//What is the finishing green of the current gradient?
+		DATA_B_GRADIENT_F, 		//What is the finishing blue of the current gradient?
+		DATA_R_GRADIENT_C, 		//What is the current red of the current gradient?
+		DATA_G_GRADIENT_C, 		//What is the current green of the current gradient?
+		DATA_B_GRADIENT_C, 		//What is the current blue of the current gradient?
+		DATA_GRADIENT_KEEP,		//What palette does the gradient finish on, if it supposed to be kept?
+		DATA_TINT_CLOCK, 		//A clock for checking every-x-frame things
+		DATA_GRADIENT_STATE,	//Is the gradient currently hidden or paused?
+		DATA_CURR_DMAP			//The current DMap
+	};
+	//end
+	//start Data
+	int __tintR[MAX_TINT_PALETTES];
+	int __tintG[MAX_TINT_PALETTES];
+	int __tintB[MAX_TINT_PALETTES];
+	int __tintData[DATA_SIZE + MAX_TINT_PALETTES];
+	int __DMap_TintData[NUM_DMTD * MAX_DMAPS];
+	enum
+	{
+		DMTD_R,
+		DMTD_G,
+		DMTD_B,
+		DMTD_BASE,
+		NUM_DMTD
+	};
+	//end
+	//start main functions
+	/*
+		Main function; run in global to keep the header working.
+	*/
+	void runTints()
+	{
+		incTintVar(DATA_TINT_CLOCK,1);
+		if(getTintVar(DATA_TINT_CLOCK)>=3600) setTintVar(DATA_TINT_CLOCK,getTintVar(DATA_TINT_CLOCK)%3600);
+		if(isGradient() && !(getTintVar(DATA_TINT_CLOCK)%GRADIENT_RATE) && !getTintVar(DATA_TINT_PAUSED))
+		{
+			if(DEBUG) Tint_Debug_Trace("Running Gradient");
+			unless(readTintFlag(DATA_GRADIENT_STATE,STATE_PAUSED)){
+				//Increment the clock
+				incTintVar(DATA_GRADIENT_COUNTER,GRADIENT_RATE);
+				unless(readTintFlag(DATA_GRADIENT_STATE,STATE_HIDDEN))
+				{
+					//Get the percentage through the transition, in decimal form (1.00 = 100%)
+					int percent = getTintVar(DATA_GRADIENT_COUNTER)/getTintVar(DATA_GRADIENT_RATE);
+					
+					//Get the current value for each R/G/B, rounded to nearest int
+					int red = Round(((getTintVar(DATA_R_GRADIENT_F) - getTintVar(DATA_R_GRADIENT_S)) * percent) + getTintVar(DATA_R_GRADIENT_S));
+					int green = Round(((getTintVar(DATA_G_GRADIENT_F) - getTintVar(DATA_G_GRADIENT_S)) * percent) + getTintVar(DATA_G_GRADIENT_S));
+					int blue = Round(((getTintVar(DATA_B_GRADIENT_F) - getTintVar(DATA_B_GRADIENT_S)) * percent) + getTintVar(DATA_B_GRADIENT_S));
+					
+					//Set the change to happen in the update section
+					incTintVar(DATA_R_CHANGED,red - getTintVar(DATA_R_GRADIENT_C));
+					incTintVar(DATA_G_CHANGED,green - getTintVar(DATA_G_GRADIENT_C));
+					incTintVar(DATA_B_CHANGED,blue - getTintVar(DATA_B_GRADIENT_C));
+					
+					//Update the current color vars
+					setTintVar(DATA_R_GRADIENT_C,red);
+					setTintVar(DATA_G_GRADIENT_C,green);
+					setTintVar(DATA_B_GRADIENT_C,blue);
+				
+					unless(isGradient())
+					{
+						if(getTintVar(DATA_GRADIENT_KEEP)>-1)
+						{
+							endGradient();
+							int kept = getTintVar(DATA_GRADIENT_KEEP);
+							setTintVar(DATA_GRADIENT_KEEP,-1);
+							setTint(kept,true);
+						}
+					}
+				}
+			}
+		}
+		if(Game->GetCurDMap() != getTintVar(DATA_CURR_DMAP))
+		{	
+			int odmap = getTintVar(DATA_CURR_DMAP);
+			int ndmap = Game->GetCurDMap();
+			incTintVar(DATA_R_CHANGED, getDMTD(ndmap, DMTD_R) - getDMTD(odmap, DMTD_R));
+			incTintVar(DATA_G_CHANGED, getDMTD(ndmap, DMTD_G) - getDMTD(odmap, DMTD_G));
+			incTintVar(DATA_B_CHANGED, getDMTD(ndmap, DMTD_B) - getDMTD(odmap, DMTD_B));
+			setTintVar(DATA_CURR_DMAP, ndmap);
+			setTintVar(DATA_UPDATED, 0);
+		}
+		if( !getTintVar(DATA_UPDATED) || (isGradient() && !(getTintVar(DATA_TINT_CLOCK)%GRADIENT_RATE)))
+		{
+			unless(getTintVar(DATA_TINT_PAUSED))
+			{
+				if(DEBUG) Tint_Debug_Trace("Updating screen...");
+				const Base b = actualBase();
+				if(b == BASE_TINTED)
+				{
+					Graphics->Tint(getTintVar(DATA_R_CHANGED),getTintVar(DATA_G_CHANGED),getTintVar(DATA_B_CHANGED));
+				}
+				else
+				{
+					Graphics->MonochromeHue(getTintVar(DATA_R_CHANGED),getTintVar(DATA_G_CHANGED),getTintVar(DATA_B_CHANGED),b==BASE_DISTRIBUTED);
+				}
+				incTintVar(DATA_R_SUM,getTintVar(DATA_R_CHANGED));
+				incTintVar(DATA_G_SUM,getTintVar(DATA_G_CHANGED));
+				incTintVar(DATA_B_SUM,getTintVar(DATA_B_CHANGED));
+				setTintVar(DATA_R_CHANGED,0);
+				setTintVar(DATA_G_CHANGED,0);
+				setTintVar(DATA_B_CHANGED,0);
+				setTintVar(DATA_UPDATED,1);
+			}
+		}
+	}
+
+	/*
+		Init function; run in an Init script
+	*/
+	void tintInit()
+	{
+		setTintVar(DATA_NEXT_PALETTE,1);
+		setTintVar(DATA_GRADIENT_KEEP,-1);
+		setTintVar(DATA_BASE, BASE_DEFAULT);
+		setTintVar(DATA_CURR_DMAP, -1); //Force update on first run cycle.
+	}
+
+	/*
+		Overload from old versions.
+	*/
+	void tintOnContinue()
+	{
+		tintOnSaveLoad();
+	}
+	/*
+		SaveLoad function; run in an 'onSaveLoad' script. Makes tints properly save/load.
+	*/
+	void tintOnSaveLoad()
+	{
+		//Clear the tint, and set all current tint in the queue to be tinted next frame- i.e. first frame after loading
+		Graphics->ClearTint();
+		setTintVar(DATA_R_CHANGED,getTintVar(DATA_R_SUM));
+		setTintVar(DATA_R_SUM,0);
+		setTintVar(DATA_G_CHANGED,getTintVar(DATA_G_SUM));
+		setTintVar(DATA_G_SUM,0);
+		setTintVar(DATA_B_CHANGED,getTintVar(DATA_B_SUM));
+		setTintVar(DATA_B_SUM,0);
+		//Clear Gradient Current counters, the gradient code will automatically re-tint itself with this.
+		setTintVar(DATA_R_GRADIENT_C,0);
+		setTintVar(DATA_G_GRADIENT_C,0);
+		setTintVar(DATA_B_GRADIENT_C,0);
+		//Force update on first run cycle.
+		setTintVar(DATA_CURR_DMAP, -1);
+	}
+	
+	/*
+		Add a tint palette to the list of palettes.
+		
+		RETURN: The Palette ID of the new palette
+	*/
+	int createTintPalette(int r, int g, int b){
+		if(DEBUG) Tint_Debug_Trace("Initializing new palette...");
+		int palID = getTintVar(DATA_NEXT_PALETTE);
+		__tintR[palID] = r;
+		__tintG[palID] = g;
+		__tintB[palID] = b;
+		incTintVar(DATA_NEXT_PALETTE,1);
+		return palID;
+	}
+	
+	/*
+		Tint a given DMap to always have a tint.
+		If a DMap is given a non-'BASE_TINTED' base, that will take priority over other bases while on that dmap.
+	*/
+	void tintDMap(int dmap, int r, int g, int b, Base base)
+	{
+		if(dmap<0||dmap>=MAX_DMAPS) return;
+		setDMTD(dmap, DMTD_R, r);
+		setDMTD(dmap, DMTD_G, g);
+		setDMTD(dmap, DMTD_B, b);
+		setDMTD(dmap, DMTD_BASE, base);
+	}
+	
+	/*
+		Tint a given DMap to always have a tint.
+		If a DMap is given a non-'BASE_TINTED' base, that will take priority over other bases while on that dmap.
+		This version will copy the R/G/B from an existing palID.
+		Will fail if: DMap is invalid, palID is invalid
+	*/
+	void tintDMap(int dmap, int palID, Base base)
+	{
+		if(dmap<0||dmap>=MAX_DMAPS) return;
+		if(palID<0||palID>=getTintVar(DATA_NEXT_PALETTE)) return;
+		setDMTD(dmap, DMTD_R, __tintR[palID]);
+		setDMTD(dmap, DMTD_G, __tintG[palID]);
+		setDMTD(dmap, DMTD_B, __tintB[palID]);
+		setDMTD(dmap, DMTD_BASE, base);
+	}
+
+	/*
+		Changes the active base for drawing.
+		
+		PARAMETER: int base, the base to change to. Use the BASE_ constants for this.
+		
+		INVALID IF: (base > BASE_MAX || base < BASE_MIN)
+		
+		ON INVALID: Return, doing nothing.
+	*/
+	void changeBase(Base base)
+	{
+		if(base < BASE_MIN || base > BASE_MAX)return;
+		if(DEBUG) Tint_Debug_Trace("Changing base...");
+		setTintVar(DATA_BASE, base);
+		setTintVar(DATA_UPDATED, 0);
+	}
+	
+	/*
+		Returns the current base set.
+	*/
+	Base getBase()
+	{
+		return <Base>(getTintVar(DATA_BASE));
+	}
+	
+	/*
+		Returns the current in-use base.
+	*/
+	Base actualBase()
+	{
+		switch(getDMTD(getTintVar(DATA_CURR_DMAP), DMTD_BASE))
+		{
+			case BASE_DISTRIBUTED:
+				return BASE_DISTRIBUTED;
+			case BASE_UNIFORM:
+				return BASE_UNIFORM;
+			case BASE_TINTED:
+			default:
+				return getBase();
+		}
+	}
+	
+	/*
+		Set if a particular tint should currently be displayed.
+		If the tint was already active, and you try to activate it, or inactive and you try to deactivate it, it will do nothing.
+		
+		PARAMETER: int palID, the palette ID of the palette you wish to set. Palette ID's are returned from createTintPalette() when it is called.
+		PARAMETER: bool active, whether or not this should be displayed.
+		
+		INVALID IF: (palID < 0 || palID >= getTintVar(DATA_NEXT_PALETTE))
+		INVALID IF: palID was passed to runGradient as end_pal, with keep==true, and is still running
+		
+		ON INVALID: Return, doing nothing
+	*/
+	void setTint(int palID, bool active)
+	{
+		if(palID < 0 || palID >= getTintVar(DATA_NEXT_PALETTE))return;
+		if((getTintVar(getPalIndex(palID))>0) == active)return;
+		if(getTintVar(DATA_GRADIENT_KEEP) == palID)return;
+		if(DEBUG) Tint_Debug_Trace("Setting tint condition....");
+		setTintVar(getPalIndex(palID), Cond(active,1,0));
+		if(active)
+		{
+			incTintVar(DATA_R_CHANGED,__tintR[palID]);
+			incTintVar(DATA_G_CHANGED,__tintG[palID]);
+			incTintVar(DATA_B_CHANGED,__tintB[palID]);
+		}
+		else
+		{
+			incTintVar(DATA_R_CHANGED,-__tintR[palID]);
+			incTintVar(DATA_G_CHANGED,-__tintG[palID]);
+			incTintVar(DATA_B_CHANGED,-__tintB[palID]);
+		}
+		setTintVar(DATA_UPDATED, 0);
+	}
+
+	/*
+		Checks if a given palette is active.
+		
+		PARAMETER: int palID, the palette ID of the palette you wish to check. Palette ID's are returned from createTintPalette() when it is called.
+		
+		INVALID IF: (palID < 0 || palID >= getTintVar(DATA_NEXT_PALETTE))
+		
+		ON INVALID: Return false.
+		
+		RETURN: True if the palette is active. See ON INVALID.
+	*/
+	bool tintIsActive(int palID)
+	{
+		if(palID < 0 || palID >= getTintVar(DATA_NEXT_PALETTE))return false;
+		return (getTintVar(getPalIndex(palID))>0);
+	}
+
+	/*
+		Clears all tints from the screen.
+	*/
+	void clearTint()
+	{
+		if(DEBUG) Tint_Debug_Trace("Clearing screen...");
+		if(isActiveGradient())endGradient();
+		setTintVar(DATA_UPDATED, 1);
+		setTintVar(DATA_R_SUM, 0);
+		setTintVar(DATA_G_SUM, 0);
+		setTintVar(DATA_B_SUM, 0);
+		setTintVar(DATA_R_CHANGED,0);
+		setTintVar(DATA_G_CHANGED,0);
+		setTintVar(DATA_B_CHANGED,0);
+		Graphics->ClearTint();
+		for(int palID = 0; palID < MAX_TINT_PALETTES; palID++)
+		{
+			setTintVar(getPalIndex(palID),0);
+		}
+	}
+
+	/*
+		Refreshes the tint, if something seems to be stuck that shouldn't be.
+	*/
+	void refreshTint()
+	{
+		setTintVar(DATA_R_SUM, 0);
+		setTintVar(DATA_G_SUM, 0);
+		setTintVar(DATA_B_SUM, 0);
+		setTintVar(DATA_R_CHANGED,0);
+		setTintVar(DATA_G_CHANGED,0);
+		setTintVar(DATA_B_CHANGED,0);
+		setTintVar(DATA_R_GRADIENT_C,0);
+		setTintVar(DATA_G_GRADIENT_C,0);
+		setTintVar(DATA_B_GRADIENT_C,0);
+		Graphics->ClearTint();
+		for(int palID = 0; palID < MAX_TINT_PALETTES; palID++)
+		{
+			if(getTintVar(getPalIndex(palID)))
+			{
+				incTintVar(DATA_R_CHANGED,__tintR[palID]);
+				incTintVar(DATA_G_CHANGED,__tintG[palID]);
+				incTintVar(DATA_B_CHANGED,__tintB[palID]);
+			}
+		}
+	}
+
+	void hideAllTints(bool hide)
+	{
+		if(<bool>(getTintVar(DATA_TINT_PAUSED)) == hide) return; //Already set, don't reset.
+		setTintVar(DATA_TINT_PAUSED, <int>hide);
+		setTintVar(DATA_UPDATED, 0);
+		if(hide)
+		{
+			setTintVar(DATA_R_SUM, 0);
+			setTintVar(DATA_G_SUM, 0);
+			setTintVar(DATA_B_SUM, 0);
+			setTintVar(DATA_R_CHANGED,0);
+			setTintVar(DATA_G_CHANGED,0);
+			setTintVar(DATA_B_CHANGED,0);
+			setTintVar(DATA_R_GRADIENT_C,0);
+			setTintVar(DATA_G_GRADIENT_C,0);
+			setTintVar(DATA_B_GRADIENT_C,0);
+			Graphics->ClearTint();
+		}
+		else refreshTint();
+	}
+	//end
+	//start Gradients
+	/*
+		Run a gradient; a gradually changing tint.
+		
+		PARAMETERS: start_r, start_g, start_b - starting tint, activated instantly when the gradient is run
+		PARAMETERS: end_r, end_g, end_b - ending tint, what the gradient will be set to when it finishes
+		PARAMATER: frames - how many frames will the gradient take to complete?
+	*/
+	void runGradient(int start_r, int start_g, int start_b, int end_r, int end_g, int end_b, int frames)
+	{
+		if(isActiveGradient())endGradient();
+		setTintVar(DATA_R_GRADIENT_S,start_r);
+		setTintVar(DATA_G_GRADIENT_S,start_g);
+		setTintVar(DATA_B_GRADIENT_S,start_b);
+		setTintVar(DATA_R_GRADIENT_F,end_r);
+		setTintVar(DATA_G_GRADIENT_F,end_g);
+		setTintVar(DATA_B_GRADIENT_F,end_b);
+		setTintVar(DATA_R_GRADIENT_C,start_r);
+		setTintVar(DATA_G_GRADIENT_C,start_g);
+		setTintVar(DATA_B_GRADIENT_C,start_b);
+		incTintVar(DATA_R_CHANGED,start_r);
+		incTintVar(DATA_G_CHANGED,start_g);
+		incTintVar(DATA_B_CHANGED,start_b);
+		setTintVar(DATA_GRADIENT_RATE,frames);
+	}
+
+	/*
+		Run a gradient; a gradually changing tint.
+		
+		PARAMATER: start_pal - a valid palID, the palette ID of the palette the gradient starts at. Palette ID's are returned from createTintPalette() when it is called.
+		PARAMATER: end_pal - a valid palID, the palette ID of the palette the gradient ends at. Palette ID's are returned from createTintPalette() when it is called.
+		PARAMATER: frames - how many frames will the gradient take to complete?
+		OPT PARAMATER: keep - When gradient ends, activate end_pal and reset gradient, so it is ready to run again. DEFAULT: false
+		
+		INVALID IF: (palID < 0 || palID >= getTintVar(DATA_NEXT_PALETTE)) //For either palID
+		INVALID IF: (keep && tintIsActive(end_pal))
+		
+		ON INVALID: Return, doing nothing
+	*/
+	void runGradient(int start_pal, int end_pal, int frames, bool keep)
+	{
+		if(start_pal < 0 || start_pal >= getTintVar(DATA_NEXT_PALETTE))return;
+		if(end_pal < 0 || end_pal >= getTintVar(DATA_NEXT_PALETTE))return;
+		if(keep && tintIsActive(end_pal))return;
+		
+		if(isActiveGradient())endGradient();
+		
+		setTintVar(DATA_R_GRADIENT_S,__tintR[start_pal]);
+		setTintVar(DATA_G_GRADIENT_S,__tintG[start_pal]);
+		setTintVar(DATA_B_GRADIENT_S,__tintB[start_pal]);
+		setTintVar(DATA_R_GRADIENT_F,__tintR[end_pal]);
+		setTintVar(DATA_G_GRADIENT_F,__tintG[end_pal]);
+		setTintVar(DATA_B_GRADIENT_F,__tintB[end_pal]);
+		setTintVar(DATA_GRADIENT_COUNTER,0);
+		setTintVar(DATA_GRADIENT_RATE,frames);
+		if(keep)setTintVar(DATA_GRADIENT_KEEP,end_pal);
+	}
+	void runGradient(int start_pal, int end_pal, int frames)
+	{
+		runGradient(start_pal,end_pal,frames,false);
+	}
+
+	/*
+		Disable the current gradient
+	*/
+	void endGradient()
+	{
+		if(DEBUG) Tint_Debug_Trace("Ending Gradient");
+		//Update the main tint, removing it from the screen at the next global call
+		incTintVar(DATA_R_CHANGED,-getTintVar(DATA_R_GRADIENT_C));
+		incTintVar(DATA_G_CHANGED,-getTintVar(DATA_G_GRADIENT_C));
+		incTintVar(DATA_B_CHANGED,-getTintVar(DATA_B_GRADIENT_C));
+		//Clear the gradient currents, so they are ready for another gradient
+		setTintVar(DATA_R_GRADIENT_C,0);
+		setTintVar(DATA_G_GRADIENT_C,0);
+		setTintVar(DATA_B_GRADIENT_C,0);
+		unhideGradient();
+		unpauseGradient();
+		//Clear gradient counter and rate
+		setTintVar(DATA_GRADIENT_COUNTER,0);
+		setTintVar(DATA_GRADIENT_RATE,0);
+		//Tell main to update the screen
+		setTintVar(DATA_UPDATED, 0);
+	}
+
+	/*
+		Hide a gradient, but still keep it running in the background. Gradient will resume when "unhideGradient" is called.
+	*/
+	void hideGradient()
+	{
+		orTintFlag(DATA_GRADIENT_STATE,STATE_HIDDEN);
+		incTintVar(DATA_R_CHANGED,-getTintVar(DATA_R_GRADIENT_C));
+		incTintVar(DATA_G_CHANGED,-getTintVar(DATA_G_GRADIENT_C));
+		incTintVar(DATA_B_CHANGED,-getTintVar(DATA_B_GRADIENT_C));
+		setTintVar(DATA_R_GRADIENT_C,0);
+		setTintVar(DATA_G_GRADIENT_C,0);
+		setTintVar(DATA_B_GRADIENT_C,0);
+		setTintVar(DATA_UPDATED, 0);
+	}
+
+	/*
+		Unhide a gradient hidden by "hideGradient"
+	*/
+	void unhideGradient(){
+		andnotTintFlag(DATA_GRADIENT_STATE,STATE_HIDDEN);
+	}
+
+	/*
+		RETURN: True if there is an active gradient which is hidden
+	*/
+	bool isHiddenGradient()
+	{
+		return isActiveGradient() && readTintFlag(DATA_GRADIENT_STATE,STATE_HIDDEN);
+	}
+
+	/*
+		Completely pause a gradient, leaving it visible, but unmoving. Gradient will resume when "unpauseGradient" is called.
+	*/
+	void pauseGradient()
+	{
+		orTintFlag(DATA_GRADIENT_STATE,STATE_PAUSED);
+	}
+
+	/*
+		Unpause a gradient paused by "pauseGradient"
+	*/
+	void unpauseGradient()
+	{
+		andnotTintFlag(DATA_GRADIENT_STATE,STATE_PAUSED);
+	}
+
+	/*
+		RETURN: True if there is an active gradient which is paused
+	*/
+	bool isPausedGradient()
+	{
+		return isActiveGradient() && readTintFlag(DATA_GRADIENT_STATE,STATE_PAUSED);
+	}
+	//end
+	//start internal functions
+	/*
+		Get a tint var. 
+		
+		PARAMETER: int index, Use DATA_ constants in the "Internal Array Indexes" section.
+		
+		INVALID IF: (index < 0 || index > DATA_SIZE)
+		
+		ON INVALID: Script errors!
+	*/
+	int getTintVar(TintDataIndex index)
+	{
+		return __tintData[index];
+	}
+
+	/*
+		Set a tint var.
+		
+		PARAMETER: int index, Use DATA_ constants in the "Internal Array Indexes" section.
+		PARAMETER: int value, the value to set to this index.
+		
+		INVALID IF: (index < 0 || index > DATA_SIZE)
+		
+		ON INVALID: Script errors!
+	*/
+	void setTintVar(TintDataIndex index, int value)
+	{
+		__tintData[index] = value;
+	}
+
+	/*
+		Increment a tint var.
+		
+		PARAMETER: int index, Use DATA_ constants in the "Internal Array Indexes" section.
+		PARAMETER: int value, the value to added to this index.
+		
+		INVALID IF: (index < 0 || index > DATA_SIZE)
+		
+		ON INVALID: Script errors!
+	*/
+	void incTintVar(TintDataIndex index, int value)
+	{
+		__tintData[index] += value;
+	}
+
+	/*
+		Bitwise OR a flag into a tint var meant for holding flags.
+		
+		PARAMETER: int index, Use DATA_ constants in the "Internal Array Indexes" section.
+		PARAMETER: int value, the value to OR to this index.
+		
+		INVALID IF: (index < 0 || index > DATA_SIZE)
+		
+		ON INVALID: Script errors!
+	*/
+	void orTintFlag(TintDataIndex index, long value)
+	{
+		__tintData[index] |= value;
+	}
+
+	/*
+		Bitwise AND+NOT a flag into a tint var meant for holding flags.
+		
+		PARAMETER: int index, Use DATA_ constants in the "Internal Array Indexes" section.
+		PARAMETER: int value, the value to AND+NOT to this index.
+		
+		INVALID IF: (index < 0 || index > DATA_SIZE)
+		
+		ON INVALID: Script errors!
+	*/
+	void andnotTintFlag(TintDataIndex index, long value)
+	{
+		__tintData[index] &= ~value;
+	}
+
+	/*
+		Bitwise check a flag from a tint var meant for holding flags.
+		
+		PARAMETER: int index, Use DATA_ constants in the "Internal Array Indexes" section.
+		PARAMETER: int value, the value to read this index.
+		
+		INVALID IF: (index < 0 || index > DATA_SIZE)
+		
+		ON INVALID: Script errors!
+		
+		RETURN: True if the flag is set
+	*/
+	bool readTintFlag(TintDataIndex index, long value)
+	{
+		return (__tintData[index] & value)>0;
+	}
+
+	/*
+		RETURN: True if a gradient is currently being process. Does NOT return true if the gradient is active, but finished.
+	*/
+	bool isGradient()
+	{
+		return (getTintVar(DATA_GRADIENT_COUNTER)<getTintVar(DATA_GRADIENT_RATE));
+	}
+
+	/*
+		RETURN: True if a gradient is active, at all.
+	*/
+	bool isActiveGradient()
+	{
+		return getTintVar(DATA_GRADIENT_COUNTER)>0;
+	}
+	
+	TintDataIndex getPalIndex(int palID)
+	{
+		return <TintDataIndex>(DATA_SIZE + palID);
+	}
+
+	/*
+		Trace a debug string
+	*/
+	void Tint_Debug_Trace(char32 str)
+	{
+		if(DEBUG) printf("[TINT.ZH] %s\n", str);
+	}
+	
+	/*
+		Sets an index of __DMap_TintData[] to a value
+	*/
+	void setDMTD(int dmap, int DMTD, int val)
+	{
+		if(dmap < 0 || dmap >= MAX_DMAPS) return;
+		__DMap_TintData[(dmap*NUM_DMTD)+DMTD] = val;
+	}
+	
+	/*
+		Gets the value from an index of __DMap_TintData[]
+	*/
+	int getDMTD(int dmap, int DMTD)
+	{
+		if(dmap < 0 || dmap >= MAX_DMAPS) return 0;
+		return __DMap_TintData[(dmap*NUM_DMTD)+DMTD];
+	}
+	//end
+}

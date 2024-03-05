@@ -1,0 +1,414 @@
+/*
+	Script Header: TypeAString.zh
+	Author: Emily
+	Version: 1.5
+	4 Mar 24
+*/
+
+#option HEADER_GUARD on
+import "std.zh"
+
+namespace TypeAString
+{
+	typedef const int DEFINE;
+
+	DEFINE MAX_LENGTH = 8192;
+	DEFINE MAX_CHARS_PER_FRAME = 2;
+
+	char32 keyboardInput[MAX_LENGTH];
+	untyped typing_vars[9];
+
+	DEFINE KEY_FINAL = KEY_SEMICOLON; //Last input key to check
+
+	enum
+	{
+		TVAR_TYPING,
+		TVAR_MAXCHARS,
+		TVAR_INDEX,
+		TVAR_ALLOWSYMBOLS,
+		TVAR_ENTERENDS,
+		TVAR_TYPING_ENDED,
+		TVAR_BACKSPACEANDDELETE,
+		TVAR_WRAP,
+		TVAR_MODE,
+		//TVAR_LEFTRIGHT = 9, /Planned feature: Left/Right arrows will move the index, and you will be able to type in-between already typed letters.
+		//TVAR_
+		TVAR_MAX
+	};
+	
+	enum TMode
+	{
+		TMODE_LEGACY = -1, //Internal use only!
+		TMODE_ALPHANUMERIC, //Letters/Numbers
+		TMODE_ALPHANUMERIC_SYMBOLS, //Letters/Numbers/'typing_allowed_symbols'
+		TMODE_ALPHABETIC, //Letters only
+		TMODE_NUMERIC_POSITIVE, //Numbers only
+		TMODE_NUMERIC, //Numbers, and `-` if it is the first character
+		TMODE_ANY //Any character at all
+	};
+
+	//Begin taking keyboard input, up to maxChars characters. Allow symbols from the allowed symbols table if "allowSymbols" is true.
+	void startTypingMode(int maxChars, bool allowSymbols)
+	{
+		clearTypedInput();
+		__setTvar(TVAR_TYPING,1);
+		__setTvar(TVAR_INDEX,0);
+		Game->TypingMode = true;
+		__setTvar(TVAR_MAXCHARS,Clamp(maxChars,0,MAX_LENGTH));
+		if(allowSymbols)__setTvar(TVAR_ALLOWSYMBOLS,1);
+		else __setTvar(TVAR_ALLOWSYMBOLS,0);
+		__setTvar(TVAR_MODE,TMODE_LEGACY);
+	}
+
+	//Begin taking keyboard input, up to maxChars characters. Only alphanumeric.
+	void startTypingMode(int maxChars)
+	{
+		startTypingMode(maxChars,false);
+	}
+
+	//Begin taking keyboard input, up to 128 chars. Only alphanumeric.
+	void startTypingMode()
+	{
+		startTypingMode(128,false);
+	}
+	
+	void startTypingMode(int maxChars, TMode mode)
+	{
+		if(mode==TMODE_LEGACY) startTypingMode(maxChars,false);
+		__setTvar(TVAR_MODE, mode);
+		clearTypedInput();
+		__setTvar(TVAR_TYPING,1);
+		__setTvar(TVAR_INDEX,0);
+		Game->TypingMode = true;
+		__setTvar(TVAR_MAXCHARS,Clamp(maxChars,0,MAX_LENGTH));
+	}
+
+	//End typing mode
+	void endTypingMode()
+	{
+		__setTvar(TVAR_TYPING,0);
+		Game->TypingMode = false;
+		__setTvar(TVAR_TYPING_ENDED,1);
+	}
+
+	void handleTyping()
+	{
+		if(__getTvar(TVAR_TYPING_ENDED))__setTvar(TVAR_TYPING_ENDED,0);
+		unless(__getTvar(TVAR_TYPING))return;
+		if(__getTvar(TVAR_BACKSPACEANDDELETE))
+		{
+			if(ReadKey(KEY_BACKSPACE))
+			{
+				__incTvar(TVAR_INDEX,-1);
+				__setTvar(TVAR_INDEX,Clamp(__getTvar(TVAR_INDEX),0,MAX_INT));
+				keyboardInput[__getTvar(TVAR_INDEX)] = 0;
+				__reorder();
+			}
+			if(ReadKey(KEY_DEL) || ReadKey(KEY_DEL_PAD))
+			{
+				keyboardInput[__getTvar(TVAR_INDEX)] = 0;
+				__reorder();
+			}
+		}
+		if(__getTvar(TVAR_ENTERENDS) && (Input->ReadKey[KEY_ENTER] || Input->ReadKey[KEY_ENTER_PAD]))
+		{
+			__setTvar(TVAR_TYPING_ENDED,1);
+			__setTvar(TVAR_TYPING,0);
+			Game->TypingMode = false;
+			return;
+		}
+		if(__getTvar(TVAR_INDEX)>=__getTvar(TVAR_MAXCHARS))
+		{
+			if(__getTvar(TVAR_WRAP))__setTvar(TVAR_INDEX,0);//If max characters specified is reached, wrap around
+			else return;
+		}
+		bool shift = PressShift();
+		char32 localBuf[MAX_CHARS_PER_FRAME + 1]; //+1 to ensure a NULL terminator is present
+		int localIndex = 0;
+		for(int i = KEY_A; i <= KEY_FINAL && localIndex < MAX_CHARS_PER_FRAME; i++)
+		{
+			if(!ReadKey(i))continue;
+			char32 c = KeyToChar(i,shift);
+			if(CapsLock())c = ConvertCase(c);
+			CharValidate valid = validateChar(c);
+			if(valid==CV_VALID)
+			{
+				localBuf[localIndex] = c;
+				++localIndex;
+			}
+			else if(valid==CV_VALIDFIRSTONLY)
+			{
+				if(localIndex==0 && __getTvar(TVAR_INDEX)==0)
+				{
+					localBuf[localIndex] = c;
+					++localIndex;
+				}
+			}
+		}
+		int startindex = __getTvar(TVAR_INDEX);
+		for(int index = startindex; index < __getTvar(TVAR_MAXCHARS); index++)
+		{
+			if(index - startindex < MAX_CHARS_PER_FRAME && localBuf[index-startindex]!=0)
+			{
+				keyboardInput[index] = localBuf[index-startindex];
+				__incTvar(TVAR_INDEX,1);
+			}
+		}
+		//strcpy(keyboardInput,__getTvar(TVAR_INDEX),localBuf,__getTvar(TVAR_MAXCHARS)-__getTvar(TVAR_INDEX));
+		//__incTvar(TVAR_INDEX,localIndex);
+	}
+	
+	CharValidate validateChar(char32 c)
+	{
+		bool valid;
+		switch(__getTvar(TVAR_MODE))
+		{
+			case TMODE_LEGACY:
+				valid = isAlphaNumeric(c);
+				unless(valid || !__getTvar(TVAR_ALLOWSYMBOLS))
+				{
+					for(int q = SizeOfArray(typing_allowed_symbols)-1; q>=0; q--)
+					{
+						if(c == typing_allowed_symbols[q])
+						{
+							valid = true;
+							break;
+						}
+					} 
+				}
+				break;
+			case TMODE_ALPHABETIC:
+				valid = isAlphabetic(c);
+				break;
+				
+			case TMODE_ALPHANUMERIC:
+				valid = isAlphaNumeric(c);
+				break;
+				
+			case TMODE_ALPHANUMERIC_SYMBOLS:
+				valid = isAlphaNumeric(c);
+				unless(valid)
+				{
+					for(int q = SizeOfArray(typing_allowed_symbols)-1; q>=0; q--)
+					{
+						if(c == typing_allowed_symbols[q])
+						{
+							valid = true;
+							break;
+						}
+					} 
+				}
+				break;
+				
+			case TMODE_NUMERIC:
+				if(c=='-') return CV_VALIDFIRSTONLY;
+			case TMODE_NUMERIC_POSITIVE:
+				valid = isNumber(c);
+				break;
+				
+			case TMODE_ANY: return CV_VALID;
+		}
+		return valid ? CV_VALID : CV_INVALID;
+	}
+	
+	enum CharValidate
+	{
+		CV_INVALID,
+		CV_VALID,
+		CV_VALIDFIRSTONLY
+	};
+
+	//Example of how it works. Load this into any .QST as Slot 2, then type stuff. Pressing ENTER will write what you typed to the console. Feel free to play around with the settings.
+	//By default, BACKSPACE and DELETE will work as well. The character max is 8 (in "startTypingMode(8)"). "int buf[9]" should be one larger than this.
+	global script typingExample
+	{
+		void run()
+		{
+			TraceNL();TraceNL();
+			//Settings:
+			setEnterEndsTyping(true);
+			setAllowBackspaceDelete(true);
+			setOverflowWraps(false);
+			//
+			startTypingMode(8, TMODE_ALPHABETIC); //letters only
+			while(true)
+			{
+				handleTyping();
+				if(typingJustEnded())
+				{
+					char32 buf[9];
+					getType(buf);
+					TraceS(buf);
+					startTypingMode(8);
+				}
+				Waitdraw();
+				Waitframe();
+			}
+		}
+	}
+
+	global script typingBasic
+	{
+		void run()
+		{
+			//You should set all three of these depending on what settings you want.
+			setEnterEndsTyping(true);
+			setAllowBackspaceDelete(true);
+			setOverflowWraps(false);
+			//
+			while(true)
+			{
+				//handleTyping() should be the FIRST thing in your while(true), so that it can cancel Hero's input if typing is active.
+				handleTyping();
+				Waitdraw();
+				Waitframe();
+			}
+		}
+	}
+
+	//Pressing ENTER will exit typing mode
+	void setEnterEndsTyping(bool allow)
+	{
+		__setTvar(TVAR_ENTERENDS,Cond(allow,1,0));
+	}
+
+	//Backspace and Delete will function, removing characters.
+	void setAllowBackspaceDelete(bool allow)
+	{
+		__setTvar(TVAR_BACKSPACEANDDELETE,Cond(allow,1,0));
+	}
+
+	//When you type the final character which fits in the alloted space, it will set your cursor back to the beginning.
+	void setOverflowWraps(bool allow)
+	{
+		__setTvar(TVAR_WRAP,Cond(allow,1,0));
+	}
+
+	//Like Waitframe(), but instead of waiting for the next frame, it waits for the player to finish typing.
+	//Do NOT call this from a global script, or you WILL crash your global script.
+	void Waittype()
+	{
+		while(__getTvar(TVAR_TYPING))Waitframe();
+	}
+
+	//Like the above, but SPECIFICALLY for global scripts.
+	//Calling this from any other script will have undefined effects, and is not recommended.
+	//This will stop any other global scripts you have running aside from this one. Keep this in mind.
+	void WaittypeGlobal()
+	{
+		while(__getTvar(TVAR_TYPING))
+		{
+			Waitframe();
+			handleTyping();
+		}
+	}
+
+	//Returns true if typing ended within the last frame.
+	bool typingJustEnded()
+	{
+		return __getTvar(TVAR_TYPING_ENDED)>0;
+	}
+
+	//Get a section of text into a buffer, with various overloads.
+	//Gets ALL text input
+	void getType(char32 buf)
+	{
+		getType(buf, 0, __getTvar(TVAR_MAXCHARS));
+	}
+
+	//Gets all text starting at index "start", inclusive.
+	void getType(char32 buf, int start)
+	{
+		getType(buf, start, __getTvar(TVAR_MAXCHARS));
+	}
+
+	//Gets all input between index "start" and "end", both inclusive.
+	void getType(char32 buf, int start, int end)
+	{
+		int bufsize = SizeOfArray(buf);
+        bool resize = false;
+		//Debug::print(keyboardInput);
+        int i = 0;
+		for(; i<=end-start && keyboardInput[i+start] != 0; i++)
+            if(i >= bufsize-1)
+            {
+                bufsize = i+2;
+                resize = true;
+            }
+        if(resize)
+            ResizeArray(buf, bufsize);
+		for(i = 0; i<=end-start && keyboardInput[i+start] != 0; i++)
+			buf[i] = keyboardInput[i+start];
+        buf[i] = 0;
+	}
+
+	//Gets the required length of the buffer for the given text, for the given start/end values to the above functions.
+	int getTypeLength(int start, int end)
+	{
+		int i = 0;
+		while(i<=end-start && keyboardInput[i+start] != 0)i++;
+		return i+1; //+1 for NULL terminator character
+	}
+
+	int getTypeLength(int start)
+	{
+		return getTypeLength(start, __getTvar(TVAR_MAXCHARS));
+	}
+
+	int getTypeLength()
+	{
+		return getTypeLength(0,__getTvar(TVAR_MAXCHARS));
+	}
+
+	//Clear the input buffer, clearing all stored text.
+	void clearTypedInput()
+	{
+		for(int i = 0; keyboardInput[i]!=0; i++)
+		{
+			keyboardInput[i]=0;
+		}
+		__setTvar(TVAR_INDEX,0);
+	}
+
+	//Clear ALL the input in the buffer, regardless of NULL characters.
+	//If something is getting stuck, use this; it is slower than clearTypedInput, but more thourough.
+	//If you need this, there is a good chance you are doing something wrong.
+	void __forceClearInput()
+	{
+		for(int i = 0; i<MAX_LENGTH; i++)
+		{
+			keyboardInput[i]=0;
+		}
+		__setTvar(TVAR_INDEX,0);
+	}
+
+	void __setTvar(int index, int value)
+	{
+		typing_vars[index] = value;
+	}
+
+	int __getTvar(int index)
+	{
+		return typing_vars[index];
+	}
+
+	void __incTvar(int index, int incBy){
+		typing_vars[index] += incBy;
+	}
+
+	void __reorder()
+	{
+		bool foundNULL = false;
+		for(int i = 0; i < MAX_LENGTH-1; i++)
+		{
+			if(keyboardInput[i]==0)foundNULL=true;
+			if(foundNULL)
+			{
+				keyboardInput[i] = keyboardInput[i+1];
+				if(keyboardInput[i] == 0)return;
+			}
+		}
+	}
+
+    char32 typing_allowed_symbols[] = {'"','!','@','#','$','%','^','&','*','(',')','-','_','=','+','[',']','{','}',';',':',',','.','<','>','/','?','|','`','~','\'','\\'};
+}
